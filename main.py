@@ -1,175 +1,165 @@
-import requests
-import csv
-import time
-from datetime import datetime, timedelta
+import os
+import sys
 import yfinance as yf
-from textblob import TextBlob
+import time
+import requests
 import feedparser
+import io
+import pandas as pd
+from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import urlencode
+import threading
+import concurrent.futures
 
-# Constants
-NASDAQ_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
-CSV_FILE = "filtered_stocks.csv"
-CACHE_DURATION = 24 * 60 * 60  # 24 hours in seconds
-NEWS_CACHE = {}  # {news_id: (sentiment, timestamp)}
-RSS_FEED_URL = "https://feeds.finance.yahoo.com/rss/2.0/headline?s=^IXIC"  # NASDAQ news feed
 
-### Step 1: Fetch NASDAQ Symbols
-def fetch_nasdaq_symbols():
-    """Fetch all NASDAQ stock symbols from the provided URL."""
-    try:
-        response = requests.get(NASDAQ_URL)
-        response.raise_for_status()
-        lines = response.text.splitlines()
-        # Extract symbols from each line (format: SYMBOL|NAME|...)
-        symbols = [line.split('|')[0] for line in lines if '|' in line and 'Symbol' not in line]
-        return symbols
-    except requests.RequestException as e:
-        print(f"Error fetching NASDAQ symbols: {e}")
-        return []
+import urllib.request
+import json
 
-### Step 2: Filter Stocks by Price and Float
-def filter_stocks(symbols):
-    """Filter stocks with price between $2-$20 and float < 20M using yfinance."""
-    filtered = []
-    for symbol in symbols:
-        try:
-            stock = yf.Ticker(symbol)
-            info = stock.info
-            price = info.get('regularMarketPrice', 0)  # Current price
-            float_shares = info.get('floatShares', float('inf'))  # Float shares
-            if 2 <= price <= 20 and float_shares < 20_000_000:
-                filtered.append(symbol)
-                print(f"Filtered {symbol}: Price={price}, Float={float_shares}")
 
-                # break loop when filtered stocks reach 5
-                if len(filtered) == 5:
-                    break
 
-        except Exception as e:
-            print(f"Error fetching data for {symbol}: {e}")
-    return filtered
+# Initialize VADER sentiment analyzer
+analyzer = SentimentIntensityAnalyzer()
 
-def save_to_csv(symbols):
-    """Save filtered symbols to a CSV file with a timestamp."""
-    with open(CSV_FILE, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['Symbol', 'Timestamp'])
-        timestamp = time.time()
-        for symbol in symbols:
-            writer.writerow([symbol, timestamp])
+def get_stock_symbols(min_price=1, max_price=20):
+    """
+    Fetches all NASDAQ stocks with last sale price below max_price using the NASDAQ stock screener API.
+    
+    Returns:
+        list: List of stock symbols with last sale price below max_price.
+    """
+    url = "https://api.nasdaq.com/api/screener/stocks?tableonly=true&limit=10000&exchange=NASDAQ"
+    headers = {
+        "User-Agent": "Mozilla/5.0",  # Some endpoints require a user-agent
+        "Accept": "application/json, text/plain, */*"
+    }
+    response = requests.get(url, headers=headers, timeout=10)
+    response.raise_for_status()  # Raises an error for bad responses
+    
+    # Parse the JSON response
+    data = response.json()
 
-def load_from_csv():
-    """Load filtered symbols from CSV if within 24 hours."""
-    try:
-        with open(CSV_FILE, 'r') as f:
-            reader = csv.reader(f)
-            next(reader)  # Skip header
-            data = list(reader)
-            if data and (time.time() - float(data[0][1])) < CACHE_DURATION:
-                return [row[0] for row in data]
-            else:
-                return None
-    except (FileNotFoundError, IndexError, ValueError):
-        return None
+    # Extract the stock data from the 'rows' key
+    stocks = data['data']['table']['rows']
+    
+    # Convert the stock data into a pandas DataFrame for easier manipulation
+    df = pd.DataFrame(stocks)
+    
+    # Clean the 'lastsale' column:
+    # - Remove the '$' symbol
+    # - Convert to numeric, coercing errors (e.g., 'n/a') to NaN
+    df['lastsale'] = pd.to_numeric(df['lastsale'].str.replace('$', '', regex=False), errors='coerce')
+    
+    # Filter for stocks with last sale price below $max_price
+    # NaN values will be excluded since NaN < max_price is False
+    filtered_df = df[(df['lastsale'] >= min_price) & (df['lastsale'] < max_price)]
+    
+    # Extract the list of symbols from the filtered DataFrame
+    symbols = filtered_df['symbol'].tolist()
+    
+    return symbols
 
-def get_filtered_stocks():
-    """Get filtered stocks, using cache if available and fresh."""
-    cached = load_from_csv()
-    if cached is not None:
-        print("Using cached stock data.")
-        return cached
-    print("Fetching new stock data...")
-    symbols = fetch_nasdaq_symbols()
-    filtered = filter_stocks(symbols)
-    save_to_csv(filtered)
-    return filtered
 
-### Step 3: Fetch and Analyze News
-def fetch_news():
-    """Fetch latest NASDAQ-related news from an RSS feed."""
-    try:
-        feed = feedparser.parse(RSS_FEED_URL)
-        if feed.bozo:
-            print(f"Error parsing RSS feed: {feed.bozo_exception}")
-            return []
-        return feed.entries
-    except Exception as e:
-        print(f"Error fetching news: {e}")
-        return []
+MAX_NEWS_AGE = '1h'
+GROUP_SIZE = 20
 
-def analyze_sentiment(text):
-    """Analyze sentiment of text on a scale from -10 to 10."""
-    analysis = TextBlob(text)
-    sentiment = analysis.sentiment.polarity * 10  # Convert polarity (-1 to 1) to -10 to 10
-    return round(sentiment, 2)
+def fetch_news(symbols, print_lock, counter, counter_lock):
+    """
+    Fetches news for a group of stock symbols from Google News RSS feed.
+    Args:
+        symbols (list): List of stock symbols.
+        print_lock (threading.Lock): Lock to synchronize console output.
+    """
+    query = f'({' OR '.join(symbols)}) AND stock when:{MAX_NEWS_AGE}'
+    # Removed time.sleep(5) since staggering is handled in main()
 
-def process_news(news_items, symbols):
-    """Process news items, identify symbols, and assign sentiment."""
-    current_time = time.time()
-    sentiments = {symbol: 0 for symbol in symbols}  # Default to neutral
+    # Construct the Google News RSS feed URL
+    base_url = "https://news.google.com/rss/search"
+    params = {
+        'q': query,
+        'hl': 'en-US',  # Language: English
+        'gl': 'US',    # Location: United States
+        'ceid': 'US:en'
+    }
+    url = base_url + '?' + urlencode(params)
 
-    for item in news_items:
-        # Use 'link' or 'id' as a unique identifier; fall back to title if missing
-        news_id = item.get('id', item.get('link', item.title))
-        # Check cache first
-        if news_id in NEWS_CACHE and (current_time - NEWS_CACHE[news_id][1]) < 7200:  # 2 hours
-            sentiment, _ = NEWS_CACHE[news_id]
+    # Fetch the RSS feed
+    response = requests.get(url)
+    if response.status_code != 200:
+        with print_lock:
+            print(f"Failed to fetch the RSS feed for {', '.join(symbols)}. Status code: {response.status_code}")
+        return
+
+    # Parse the RSS feed
+    feed = feedparser.parse(response.text)
+
+    news_list = []
+    for entry in feed.entries:
+        news_list.append(entry)
+
+    # Update the news counter
+    with counter_lock:
+        counter[0] += len(news_list)
+
+    # Display the results with synchronized output
+    with print_lock:
+        if not news_list:
+            print(f"No news articles found for {', '.join(symbols)} in the past {MAX_NEWS_AGE}.")
         else:
-            # Combine title and summary (if available) for analysis
-            text = item.title + " " + item.get('summary', '')
-            sentiment = analyze_sentiment(text)
-            NEWS_CACHE[news_id] = (sentiment, current_time)
+            print(f"\nFound {len(news_list)} news articles for {', '.join(symbols)} in the past {MAX_NEWS_AGE}:\n")
+            for i, news in enumerate(news_list, 1):
+                print(f"Article {i}:")
+                print(f"Title: {news.title}")
+                print(f"Link: {news.link}")
+                print(f"Published: {news.published}")
+                print()
 
-        # Match stock symbols in the news text
-        for symbol in symbols:
-            if symbol in text:
-                # Only update if news is within the last hour
-                if (current_time - time.mktime(item.published_parsed)) < 3600:  # 1 hour
-                    sentiments[symbol] = sentiment
-                    print(f"News for {symbol}: '{item.title}' - Sentiment: {sentiment}")
-                break
-
-    return sentiments
-
-def clean_cache():
-    """Remove news cache entries older than 2 hours."""
-    current_time = time.time()
-    to_remove = [k for k, v in NEWS_CACHE.items() if (current_time - v[1]) > 7200]
-    for k in to_remove:
-        del NEWS_CACHE[k]
-
-### Main Application Loop
 def main():
-    """Main loop to continuously monitor and analyze stock news."""
-    print("Starting Live Stock News Research App...")
-    while True:
-        # Get filtered stock list (cached or fresh)
-        symbols = get_filtered_stocks()
-        if not symbols:
-            print("No stocks found or error occurred. Retrying in 60 seconds...")
-            time.sleep(60)
-            continue
+    """
+    Main function to run the app:
+    - Selects stocks based on criteria
+    - Fetches news for all stock groups in parallel
+    - Prints results to the console
+    """
+    # print starting time
+    start_time = datetime.now()
+    print(f"Start at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    stocks = get_stock_symbols()
+    
+    if not stocks:
+        print("No stocks selected based on criteria. Exiting.")
+        return
+    
+    print(f"Selected {len(stocks)} stocks")
+    time.sleep(5)
+    
+    print("=" * 50)
+    print(f"Update at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    stock_groups = [stocks[i:i + GROUP_SIZE] for i in range(0, len(stocks), GROUP_SIZE)]
+    
+    # Initialize a lock for synchronized printing
+    print_lock = threading.Lock()
+    counter_lock = threading.Lock()
+    total_news_counter = [0]  # Using a list to allow modification in threads
+    
+    # Use ThreadPoolExecutor to fetch news in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        for group in stock_groups:
+            executor.submit(fetch_news, group, print_lock, total_news_counter, counter_lock)
+            time.sleep(0.5)  # Stagger submissions to respect rate limits
 
-        # Fetch and process news
-        news_items = fetch_news()
-        if not news_items:
-            print("No news fetched. Retrying in 60 seconds...")
-            time.sleep(60)
-            continue
+    # Print the total number of news articles found
+    print("=" * 50)
+    print(f"Total news articles found across all groups: {total_news_counter[0]}")
+    print("=" * 50)
 
-        sentiments = process_news(news_items, symbols)
-        
-        # Display current sentiments (could be used for trading decisions)
-        for symbol, sentiment in sentiments.items():
-            if sentiment != 0:  # Only show non-neutral sentiments
-                print(f"{symbol}: Sentiment = {sentiment}")
+    # print ending time
+    print(f"End at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-        # Clean up old cache entries
-        clean_cache()
-
-        # Wait before the next iteration
-        print(f"Waiting 60 seconds before next check... (Cache size: {len(NEWS_CACHE)})")
-        time.sleep(10)
+    # print total execution time
+    print(f"Total execution time: {datetime.now() - start_time}")
 
 if __name__ == "__main__":
     main()
